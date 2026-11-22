@@ -9,7 +9,7 @@ import json
 from statistics import mean
 
 from eval.eval_functions import score_context
-from eval.rag_example import RAG, to_context
+from eval.rag_example import SimpleRAG, to_context
 
 KS = (1, 3, 5)
 
@@ -22,7 +22,7 @@ def main():
 
     with open(args.dataset_path, encoding="utf-8") as source:
         items = [json.loads(line) for line in source if line.strip()]
-    rag = RAG(use_bank_filter=not args.no_bank_filter)
+    rag = SimpleRAG(use_bank_filter=not args.no_bank_filter)  # поиск тот же, что у агента
     scores = {k: [] for k in KS}
     for number, item in enumerate(items, start=1):
         documents = rag.search(item["question"], k=max(KS))  # один запрос, top-1 и top-3 — его начало

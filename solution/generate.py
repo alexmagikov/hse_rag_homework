@@ -4,23 +4,43 @@ import json
 import os
 import re
 import time
+from collections import deque
 
 import requests
+from langsmith import traceable
 
 LLM_URL = "https://claude.gigaparsers.ru/v1/messages"
 LLM_MODEL = "deepseek-flash"
 ATTEMPTS = 8  # попыток на запрос, если сервис недоступен или перегружен
 RETRY_STATUSES = (429, 500, 502, 503, 504, 529)
+# Лимит ключа LLM_API_KEY: сервис отвечает 429 «rate limit 10/min exceeded for this key».
+LLM_REQUESTS_PER_MINUTE = int(os.environ.get("LLM_REQUESTS_PER_MINUTE", "10"))
+LLM_WINDOW = 61.0  # секунд: минута с запасом, чтобы окно сервиса точно успело освободиться
+llm_requests = deque()  # время последних запросов к LLM из этого процесса
 
 SYSTEM_PROMPT = """Ты отвечаешь на вопросы по финансовой отчётности банков. Отвечай только по страницам отчётов, которые даны в сообщении.
 
 Правила:
-1. Дай точный и полный ответ: все запрошенные показатели с единицами измерения, валютой и периодом, как в отчёте. Если вопрос просит посчитать (разницу, долю, отношение), посчитай и приведи результат вместе с исходными числами.
+1. Дай точный и полный ответ: все запрошенные показатели с единицами измерения, валютой и периодом, как в отчёте. Если вопрос просит посчитать или сравнить (разницу, долю, отношение, что больше), сначала приведи числа к одним единицам (тыс., млн, млрд), потом посчитай и приведи результат вместе с исходными числами.
 2. Пиши числа в русской записи: пробел разделяет разряды, запятая отделяет дробную часть (1 151; 26 926,8). В отчётах ЗАО «Альфа-Банк» (Беларусь) разряды разделены запятой на английский манер: там 1,151 означает 1 151, переводи такие числа в русскую запись.
 3. Не отказывайся отвечать. Если данных не хватает, дай лучший ответ, который можно получить из страниц.
-4. В pages перечисли только страницы, на которых основан ответ, их метками, например "vtb_2024_annual:45".
+4. В pages перечисли метками (например "vtb_2024_annual:45") все страницы, где есть числа и факты из твоего ответа. Если одно и то же число приведено и в основной форме отчётности, и в примечании к ней, укажи обе страницы. Если нужная таблица начинается на одной странице и продолжается на следующей, укажи и страницу, где она начинается. Не указывай страницы, на которых нет данных из ответа.
+5. Отвечай только на то, что спрошено. Не добавляй неспрошенные показатели, разбивки по этапам или статьям и комментарии о расхождениях в отчёте. Исходные числа приводи, только если вопрос требует расчёта или сравнения.
 
 Верни только JSON без Markdown: {"answer": "ответ на русском", "pages": ["doc_id:page", ...]}"""
+
+
+def wait_for_llm_slot():
+    """Ждёт, пока за последние LLM_WINDOW секунд будет меньше LLM_REQUESTS_PER_MINUTE запросов.
+    Вызывается перед каждым запросом к LLM: шаги агента, ответ, судья — у них общий лимит ключа."""
+    while True:
+        now = time.monotonic()
+        while llm_requests and now - llm_requests[0] >= LLM_WINDOW:
+            llm_requests.popleft()
+        if len(llm_requests) < LLM_REQUESTS_PER_MINUTE:
+            break
+        time.sleep(LLM_WINDOW - (now - llm_requests[0]))
+    llm_requests.append(time.monotonic())
 
 
 def retry_wait(response, attempt):
@@ -29,9 +49,11 @@ def retry_wait(response, attempt):
     return float(retry_after) if retry_after.isdigit() else min(5 * 2 ** attempt, 60)
 
 
+@traceable(run_type="llm", name="deepseek-flash")
 def call_llm(system, user):
     for attempt in range(ATTEMPTS):
         response = None
+        wait_for_llm_slot()
         try:
             response = requests.post(
                 LLM_URL,
@@ -64,6 +86,7 @@ def page_label(document):
     return f"{document.metadata['doc_id']}:{document.metadata['page']}"
 
 
+@traceable(name="generate_answer")
 def generate_answer(question, documents):
     """Ответ на вопрос и те страницы из documents, на которых он основан."""
     pages = "\n\n".join(f"=== Страница {page_label(d)} ===\n{d.page_content}" for d in documents)

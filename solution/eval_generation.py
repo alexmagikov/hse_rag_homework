@@ -6,30 +6,13 @@
 
 import argparse
 import json
-import time
 from statistics import mean
 
-import requests
-
-from eval.eval_functions import score_answer, score_context
+from eval.eval_functions import score_context
 from eval.rag_example import to_context
 from solution.build_index import load_pages, page_id
-from solution.generate import ATTEMPTS, generate_answer, retry_wait
-
-
-def judge(gold_answer, answer):
-    """score_answer с повторами при 429 и сбоях сети: сам судья не повторяет запрос."""
-    for attempt in range(ATTEMPTS):
-        try:
-            return score_answer(gold_answer, answer)
-        except (requests.ConnectionError, requests.Timeout):
-            if attempt == ATTEMPTS - 1:
-                raise
-            time.sleep(retry_wait(None, attempt))
-        except requests.HTTPError as error:
-            if error.response is None or error.response.status_code != 429 or attempt == ATTEMPTS - 1:
-                raise
-            time.sleep(retry_wait(error.response, attempt))
+from solution.generate import generate_answer
+from solution.judge import judge
 
 
 def main():
