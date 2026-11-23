@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import sys
 import time
 from collections import deque
 
@@ -63,6 +64,8 @@ def retry_wait(response, attempt):
     wait = float(retry_after) if retry_after.isdigit() else min(5 * 2 ** attempt, 60)
     if wait > MAX_RETRY_WAIT:
         raise LLMQuotaExceeded(f"Сервис LLM просит подождать {wait / 3600:.1f} ч: {response.text[:300]}")
+    reason = f"ответ {response.status_code}" if response is not None else "сбой соединения"
+    print(f"LLM: {reason}, повтор через {wait:.0f} с", file=sys.stderr, flush=True)  # видно в логе прогона
     return wait
 
 
@@ -105,10 +108,18 @@ def page_label(document):
     return f"{document.metadata['doc_id']}:{document.metadata['page']}"
 
 
+def page_heading(document):
+    """Строка перед текстом страницы для модели. Единицы обычно указаны один раз в шапке формы отчётности,
+    а на страницах примечаний их нет, поэтому показываем основные единицы отчёта (metadata["units"])."""
+    units = document.metadata.get("units")
+    note = f" (суммы в отчёте, если на странице не указано иное: {units})" if units else ""
+    return f"=== Страница {page_label(document)}{note} ==="
+
+
 @traceable(name="generate_answer")
 def generate_answer(question, documents):
     """Ответ на вопрос и те страницы из documents, на которых он основан."""
-    pages = "\n\n".join(f"=== Страница {page_label(d)} ===\n{d.page_content}" for d in documents)
+    pages = "\n\n".join(f"{page_heading(d)}\n{d.page_content}" for d in documents)
     reply = call_llm(SYSTEM_PROMPT, f"Страницы отчётов:\n\n{pages}\n\nВопрос: {question}")
     try:
         decision = json.loads(re.search(r"\{.*\}", reply, re.S).group(0))  # модель иногда оборачивает JSON в ```

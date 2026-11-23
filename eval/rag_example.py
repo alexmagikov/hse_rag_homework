@@ -24,13 +24,14 @@ from langsmith import traceable
 from rank_bm25 import BM25Okapi
 
 from solution.build_index import open_index, page_id
-from solution.generate import (ATTEMPTS, LLM_MODEL, count_tokens, generate_answer, page_label, retry_wait,
-                               wait_for_llm_slot)
+from solution.generate import (ATTEMPTS, LLM_MODEL, count_tokens, generate_answer, page_heading, page_label,
+                               retry_wait, wait_for_llm_slot)
 
 CANDIDATES = 50  # сколько страниц берём из векторного поиска для переранжирования
 DENSE_WEIGHT = 0.3  # вес векторного поиска в RRF, остальное — BM25 (подобрано на train)
 RRF_C = 60
 SIX_MONTHS = re.compile(r"шест\w* месяц|6 месяц|30 июня|полугод|промежуточн", re.IGNORECASE)
+UNITS = re.compile(r"в\s+(?:миллиардах|миллионах|тысячах)\s+(?:(?:российских|белорусских)\s+)?рубл\w*", re.IGNORECASE)
 MAX_SEARCHES = 4  # больше поисков на вопрос агент не делает: лимиты сервисов и время ответа
 
 # Как банки называют в вопросах. Ключ — код банка, как в doc_id и в метаданных индекса.
@@ -88,8 +89,21 @@ def without_self(inputs):
 
 
 def pages_text(documents):
-    """Что видит агент: метка и полный текст каждой найденной страницы."""
-    return "\n\n".join(f"=== Страница {page_label(d)} ===\n{d.page_content}" for d in documents)
+    """Что видит агент: метка, единицы отчёта и полный текст каждой найденной страницы."""
+    return "\n\n".join(f"{page_heading(d)}\n{d.page_content}" for d in documents)
+
+
+def report_units(ids, texts):
+    """Основные единицы каждого отчёта: самая частая фраза вида «в миллионах российских рублей».
+    В отчёте их пишут в шапке форм, а примерно на 3/4 страниц единиц нет совсем."""
+    phrases = {}
+    for page, text in zip(ids, texts):
+        doc_id = page.split(":")[0]
+        for phrase in UNITS.findall(text):
+            counts = phrases.setdefault(doc_id, {})
+            phrase = " ".join(phrase.lower().split())
+            counts[phrase] = counts.get(phrase, 0) + 1
+    return {doc_id: max(counts, key=counts.get) for doc_id, counts in phrases.items()}
 
 
 def chosen_pages(message, documents):
@@ -114,6 +128,7 @@ class SimpleRAG:
         stored = self.store.get(include=["documents"])  # те же тексты страниц, что в векторном индексе
         self.bm25_rows = {page: row for row, page in enumerate(stored["ids"])}
         self.bm25 = BM25Okapi([tokenize(text) for text in stored["documents"]])
+        self.report_units = report_units(stored["ids"], stored["documents"])
         self.k = k
         self.use_bank_filter = use_bank_filter
 
@@ -145,6 +160,8 @@ class SimpleRAG:
         text_year, text_period = target_report(question)
         year, period = year or text_year, period or text_period
         ranked = sorted(candidates, key=lambda d: (report_priority(d, year, period), -fused[page_id(d)]))
+        for document in ranked:  # единицы отчёта для модели: на странице их часто нет
+            document.metadata["units"] = self.report_units.get(document.metadata["doc_id"])
         return ranked[:k or self.k]
 
     @traceable(name="rag", process_inputs=without_self)
