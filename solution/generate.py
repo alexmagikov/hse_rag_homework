@@ -17,6 +17,19 @@ RETRY_STATUSES = (429, 500, 502, 503, 504, 529)
 LLM_REQUESTS_PER_MINUTE = int(os.environ.get("LLM_REQUESTS_PER_MINUTE", "10"))
 LLM_WINDOW = 61.0  # секунд: минута с запасом, чтобы окно сервиса точно успело освободиться
 llm_requests = deque()  # время последних запросов к LLM из этого процесса
+# Ещё у ключа дневной лимит токенов (2 млн): тогда сервис просит ждать часы — ждать нет смысла.
+MAX_RETRY_WAIT = 300  # секунд
+llm_tokens = {"input": 0, "output": 0}  # токены генерации и шагов агента за процесс (судья не учитывается)
+
+
+class LLMQuotaExceeded(RuntimeError):
+    """Сервис LLM просит ждать дольше MAX_RETRY_WAIT: обычно исчерпан дневной лимит токенов ключа."""
+
+
+def count_tokens(usage):
+    """Добавляет токены из ответа сервиса: usage в JSON-ответе или usage_metadata сообщения LangChain."""
+    llm_tokens["input"] += (usage or {}).get("input_tokens", 0)
+    llm_tokens["output"] += (usage or {}).get("output_tokens", 0)
 
 SYSTEM_PROMPT = """Ты отвечаешь на вопросы по финансовой отчётности банков. Отвечай только по страницам отчётов, которые даны в сообщении.
 
@@ -44,9 +57,13 @@ def wait_for_llm_slot():
 
 
 def retry_wait(response, attempt):
-    """Сколько ждать перед повтором: сколько попросил сервис (Retry-After), иначе 5, 10, 20, 40, 60 с."""
+    """Сколько ждать перед повтором: сколько попросил сервис (Retry-After), иначе 5, 10, 20, 40, 60 с.
+    Если сервис просит ждать дольше MAX_RETRY_WAIT, останавливаемся с LLMQuotaExceeded."""
     retry_after = response.headers.get("retry-after", "") if response is not None else ""
-    return float(retry_after) if retry_after.isdigit() else min(5 * 2 ** attempt, 60)
+    wait = float(retry_after) if retry_after.isdigit() else min(5 * 2 ** attempt, 60)
+    if wait > MAX_RETRY_WAIT:
+        raise LLMQuotaExceeded(f"Сервис LLM просит подождать {wait / 3600:.1f} ч: {response.text[:300]}")
+    return wait
 
 
 @traceable(run_type="llm", name="deepseek-flash")
@@ -79,7 +96,9 @@ def call_llm(system, user):
         time.sleep(retry_wait(response, attempt))  # сервис недоступен или перегружен — ждём и пробуем ещё раз
     if response.status_code >= 400:  # текст ответа объясняет причину, например какой лимит превышен
         raise requests.HTTPError(f"{response.status_code}: {response.text[:300]}", response=response)
-    return "".join(block["text"] for block in response.json()["content"] if block["type"] == "text").strip()
+    body = response.json()
+    count_tokens(body.get("usage"))
+    return "".join(block["text"] for block in body["content"] if block["type"] == "text").strip()
 
 
 def page_label(document):

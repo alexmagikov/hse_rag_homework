@@ -24,7 +24,8 @@ from langsmith import traceable
 from rank_bm25 import BM25Okapi
 
 from solution.build_index import open_index, page_id
-from solution.generate import ATTEMPTS, LLM_MODEL, generate_answer, page_label, retry_wait, wait_for_llm_slot
+from solution.generate import (ATTEMPTS, LLM_MODEL, count_tokens, generate_answer, page_label, retry_wait,
+                               wait_for_llm_slot)
 
 CANDIDATES = 50  # сколько страниц берём из векторного поиска для переранжирования
 DENSE_WEIGHT = 0.3  # вес векторного поиска в RRF, остальное — BM25 (подобрано на train)
@@ -54,7 +55,7 @@ AGENT_PROMPT = """Ты ищешь данные для ответа на вопр
 - Если в вопросе несколько дат, периодов, банков или показателей (изменение, отношение, доля, сравнение), ищи каждое недостающее отдельным запросом.
 - После каждого поиска проверь, нашлись ли все нужные числа. Не повторяй прежний запрос, меняй формулировку, дату или отчёт.
 
-Когда данных достаточно или новые поиски ничего не дают, ответь одним словом «Готово» без вызова инструмента. Окончательный ответ сформирует следующий шаг."""
+Когда данных достаточно или новые поиски ничего не дают, ответь без вызова инструмента: перечисли через запятую метки страниц, где есть данные для ответа, например «vtb_2024_annual:45, vtb_2024_annual:46». Если таблица продолжается на соседней странице, укажи обе. Окончательный ответ по этим страницам сформирует следующий шаг."""
 
 
 def find_banks(question):
@@ -87,8 +88,14 @@ def without_self(inputs):
 
 
 def pages_text(documents):
-    """Текст найденных страниц для модели: метка страницы и её содержимое."""
+    """Что видит агент: метка и полный текст каждой найденной страницы."""
     return "\n\n".join(f"=== Страница {page_label(d)} ===\n{d.page_content}" for d in documents)
+
+
+def chosen_pages(message, documents):
+    """Страницы, которые агент перечислил в последнем ответе. Пусто — агент ничего подходящего не назвал."""
+    labels = set(re.findall(r"[a-z]+_20\d\d_(?:annual|6m):\d+", message.text))
+    return [document for document in documents if page_label(document) in labels]
 
 
 def to_context(documents):
@@ -180,11 +187,14 @@ class RAG(SimpleRAG):
             for attempt in range(ATTEMPTS):
                 wait_for_llm_slot()
                 try:
-                    return {"messages": [model.invoke(messages)]}
-                except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.InternalServerError):
+                    reply = model.invoke(messages)
+                except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.InternalServerError) as error:
                     if attempt == ATTEMPTS - 1:  # 429, сбой сети или таймаут, 5xx
                         raise
-                    time.sleep(retry_wait(None, attempt))
+                    time.sleep(retry_wait(getattr(error, "response", None), attempt))
+                else:
+                    count_tokens(reply.usage_metadata)
+                    return {"messages": [reply]}
 
         def route_after_model(state: MessagesState):
             searches = sum(isinstance(message, ToolMessage) for message in state["messages"])
@@ -216,5 +226,9 @@ class RAG(SimpleRAG):
             if isinstance(message, ToolMessage) and message.artifact:
                 for document in message.artifact:
                     documents.setdefault(page_id(document), document)
-        answer, used = generate_answer(question, list(documents.values()))
+        documents = list(documents.values())
+        last = state["messages"][-1]
+        # Агент перечислил нужные страницы — отвечаем по ним. Если не перечислил (или упёрся в лимит поисков) — по всем.
+        chosen = [] if last.tool_calls else chosen_pages(last, documents)
+        answer, used = generate_answer(question, chosen or documents)
         return {"answer": answer, "context": to_context(used)}

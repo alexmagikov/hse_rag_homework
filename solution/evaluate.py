@@ -11,6 +11,7 @@ from pathlib import Path
 
 import eval.evaluator_excel as evaluator_excel
 from eval.rag_example import SimpleRAG
+from solution.generate import llm_tokens
 from solution.judge import judge
 
 
@@ -24,6 +25,12 @@ def main():
     if args.simple:
         evaluator_excel.RAG = SimpleRAG
     print(evaluator_excel.evaluate(args.dataset_path, args.output))
+
+    with open(args.dataset_path, encoding="utf-8") as source:
+        questions = sum(1 for line in source if line.strip())
+    total = llm_tokens["input"] + llm_tokens["output"]
+    print(f"Токены LLM без судьи: вход {llm_tokens['input']}, выход {llm_tokens['output']}, "
+          f"всего {total}, на вопрос {total / questions:.0f}. Судья — примерно ещё 1 тыс. на вопрос.")
 
 
 if __name__ == "__main__":
